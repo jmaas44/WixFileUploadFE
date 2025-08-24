@@ -22,69 +22,80 @@
   </div>
 
   <script>
-    const INIT_ENDPOINT = "https://wix-file-upload-be.vercel.app/api/init";
+  const INIT_ENDPOINT  = "https://wix-file-upload-be.vercel.app/api/init";
+  const RELAY_ENDPOINT = "https://wix-file-upload-be.vercel.app/api/relay";
+  const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB per request
 
-    async function upload() {
-      const file = document.getElementById('fileInput').files[0];
-      const status = document.getElementById('status');
-      const progress = document.getElementById('progress');
+  const $ = id => document.getElementById(id);
 
-      if (!file) {
-        status.textContent = "Please choose a file first.";
-        return;
-      }
+  async function upload() {
+    const file = $("fileInput").files?.[0];
+    const status = $("status");
+    const progress = $("progress");
+    if (!file) { status.textContent = "Please choose a file first."; return; }
 
-      status.textContent = "Starting upload...";
-      progress.style.display = "block";
-      progress.value = 0;
+    status.textContent = "Starting upload…";
+    progress.style.display = "block"; progress.value = 0;
 
-      try {
-        // 1. Ask backend for resumable session URL
-        const initRes = await fetch(INIT_ENDPOINT, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: file.name,
-            mimeType: file.type || "application/octet-stream",
-            size: file.size
-          })
-        });
-        const initData = await initRes.json();
-        if (!initData.ok) throw new Error(initData.error || "Init failed");
-
-        const uploadUrl = initData.uploadUrl;
-
-        // 2. Send file to Google Drive directly
-        const xhr = new XMLHttpRequest();
-        xhr.open("PUT", uploadUrl, true);
-        xhr.setRequestHeader("Content-Range", `bytes 0-${file.size - 1}/${file.size}`);
-
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            const percent = (e.loaded / e.total) * 100;
-            progress.value = percent;
-            status.textContent = `Uploading... ${percent.toFixed(1)}%`;
-          }
-        };
-
-        xhr.onload = () => {
-          if (xhr.status === 200 || xhr.status === 201) {
-            status.textContent = "✅ Upload complete!";
-          } else {
-            status.textContent = "❌ Upload failed: " + xhr.responseText;
-          }
-        };
-
-        xhr.onerror = () => {
-          status.textContent = "❌ Network error during upload.";
-        };
-
-        xhr.send(file);
-
-      } catch (err) {
-        status.textContent = "❌ Error: " + err.message;
-      }
+    // 1) Get resumable URL from backend
+    const initRes = await fetch(INIT_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: file.name,
+        mimeType: file.type || "application/octet-stream",
+        size: file.size
+      })
+    });
+    const initData = await initRes.json();
+    if (!initRes.ok || !initData.ok || !initData.uploadUrl) {
+      status.textContent = "Init failed: " + (initData.error || initRes.statusText);
+      return;
     }
-  </script>
+    const uploadUrl = initData.uploadUrl;
+
+    // 2) Send chunks via the relay (backend talks to Google)
+    let offset = 0;
+    try {
+      while (offset < file.size) {
+        const end = Math.min(offset + CHUNK_SIZE, file.size);
+        const chunk = file.slice(offset, end);
+
+        const r = await fetch(RELAY_ENDPOINT, {
+          method: "POST",
+          headers: {
+            "x-upload-url": uploadUrl,
+            "x-start": String(offset),
+            "x-end": String(end),
+            "x-total": String(file.size)
+          },
+          body: chunk
+        });
+
+        if (r.status === 308) {
+          const range = r.headers.get("Range"); // bytes=0-8388607
+          if (range) {
+            const m = range.match(/(\d+)-(\d+)$/);
+            offset = m ? (parseInt(m[2], 10) + 1) : end;
+          } else {
+            offset = end;
+          }
+        } else if (r.ok) {
+          offset = file.size; // done (200/201)
+        } else {
+          const t = await r.text().catch(()=>r.statusText);
+          throw new Error(`${r.status} ${t}`);
+        }
+
+        progress.value = Math.round((offset / file.size) * 100);
+        status.textContent = `Uploading… ${progress.value}%`;
+      }
+
+      status.textContent = "✅ Upload complete!";
+    } catch (err) {
+      status.textContent = "❌ Upload failed: " + err.message;
+    }
+  }
+</script>
 </body>
 </html>
